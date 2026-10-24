@@ -177,6 +177,37 @@ mod refresh_tests {
         let closed=tokio::time::timeout(std::time::Duration::from_secs(15),closed_rx).await;
         assert!(closed.is_ok(),"a blocked consumer must not keep a dead signaling socket open");
     }
+    #[tokio::test]
+    async fn stalled_event_delivery_still_reports_disconnected() {
+        use futures_util::{SinkExt,StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp,_)=listener.accept().await.unwrap();
+            let socket=tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let (mut sink,mut stream)=socket.split();
+            // A long window: the send stall must fire before the heartbeat deadline.
+            sink.send(Message::Text(r#"0{"pingInterval":30000,"pingTimeout":30000}"#.into())).await.unwrap();
+            let _=stream.next().await;
+            sink.send(Message::Text("40{}".into())).await.unwrap();
+            loop {
+                tokio::select! {
+                    r=stream.next()=>{ if matches!(r,None|Some(Err(_))|Some(Ok(Message::Close(_)))){return} }
+                    _=tokio::time::sleep(std::time::Duration::from_millis(50))=>{
+                        if sink.send(Message::Text(r#"42["bmsg_push",{}]"#.into())).await.is_err(){return}
+                    }
+                }
+            }
+        });
+        let (sender,mut events)=tokio::sync::mpsc::channel(1);
+        let _client=super::SignalingClient::connect(&format!("ws://{address}"),"synthetic-only",sender).await.unwrap();
+        // Let SEND_STALL_TIMEOUT expire while nothing drains the queue.
+        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+        assert!(matches!(events.recv().await,Some(super::SignalingEvent::Connected)));
+        let disconnected=tokio::time::timeout(std::time::Duration::from_secs(5),events.recv()).await;
+        assert!(matches!(disconnected,Ok(Some(super::SignalingEvent::Disconnected))),"a stalled delivery must still report Disconnected");
+    }
 }
 
 impl SignalingClient {
@@ -479,6 +510,12 @@ impl SignalingClient {
                     _ => {}
                 }
             }
+            // A stalled event queue or a writer that already stopped can end this
+            // loop without a delivered Disconnected. Hand one off from a detached
+            // task so the main loop always learns the room is dead; duplicates are
+            // harmless because it breaks on the first one.
+            let events = event_sender.clone();
+            tokio::spawn(async move { let _ = events.send(SignalingEvent::Disconnected).await; });
             receiver_done.store(true, Ordering::Relaxed);
             log::info!("Signaling receiver stopped: generation={} age_s={}",generation,started.elapsed().as_secs());
             // Live peer callbacks can retain the old SignalingClient sender.
